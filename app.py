@@ -3,22 +3,67 @@ import pandas as pd
 import requests
 import json
 import re
+import os
 from concurrent.futures import ThreadPoolExecutor
 
-# --- PAGE CONFIG ---
+# --- 1. HARDCODED API DEFINITIONS (Optimized from your Swagger) ---
+# We group these by Tag to make the Dropdown cleaner (78 endpoints -> 15 Categories)
+
+API_DEFINITIONS = {
+    "Fundamental Analysis": [
+        {"label": "Get Company Fundamental Analysis", "url": "/companies/{company_id}/fundamental-analysis", "params": ["company_id"]},
+        {"label": "Get Company Fundamental Sections", "url": "/companies/{company_id}/fundamental-sections", "params": ["company_id"]},
+        {"label": "Get Company Fundamental Parameters", "url": "/companies/{company_id}/fundamental-parameters", "params": ["company_id"]},
+        {"label": "Get Target Price", "url": "/companies/{company_id}/target-price", "params": ["company_id"]},
+    ],
+    "ESG Analysis": [
+        {"label": "Get Company ESG Analysis", "url": "/companies/{company_id}/esg-analysis", "params": ["company_id"]},
+        {"label": "Get Company ESG Sections", "url": "/companies/{company_id}/esg-sections", "params": ["company_id"]},
+        {"label": "Get Company ESG Parameters", "url": "/companies/{company_id}/esg-parameters", "params": ["company_id"]},
+        {"label": "Get Sustainability Incidents", "url": "/companies/{company_id}/sustainability-incidents", "params": ["company_id"]},
+    ],
+    "Technical Analysis": [
+        {"label": "Get Company Technical Analysis", "url": "/companies/{company_id}/technical-analysis", "params": ["company_id"]},
+        {"label": "Get Company Technical Parameters", "url": "/companies/{company_id}/technical-parameters", "params": ["company_id"]},
+        {"label": "Get Alternative Asset Technical", "url": "/alternative-assets/{asset_id}/technical-analysis", "params": ["asset_id"]},
+    ],
+    "Company Metadata": [
+        {"label": "Get Company Details", "url": "/companies/{company_id}", "params": ["company_id"]},
+        {"label": "Identifier Search (ISIN/Ticker to ID)", "url": "/identifier-search", "params": []}, 
+    ],
+    "Company Market Data": [
+        {"label": "Get Company Market Data", "url": "/companies/{company_id}/market", "params": ["company_id"]},
+        {"label": "Get Market Statistics", "url": "/companies/{company_id}/market-statistics", "params": ["company_id"]},
+        {"label": "Get Trading Items", "url": "/companies/{company_id}/trading-items", "params": ["company_id"]},
+    ],
+    "Company News": [
+        {"label": "Get Company News", "url": "/companies/{company_id}/news", "params": ["company_id"]},
+        {"label": "Get News Sentiment", "url": "/companies/{company_id}/news-sentiment", "params": ["company_id"]},
+    ],
+    "Funds": [
+        {"label": "Get Fund Details", "url": "/funds/{fund_id}", "params": ["fund_id"]},
+        {"label": "Get Fund Analysis", "url": "/funds/{fund_id}/analysis", "params": ["fund_id"]},
+        {"label": "Get Fund Holdings", "url": "/funds/{fund_id}/holdings", "params": ["fund_id"]},
+        {"label": "Get Fund ESG Analysis", "url": "/funds/{fund_id}/esg-analysis", "params": ["fund_id"]},
+    ],
+    "Alternative Assets": [
+        {"label": "Get Crypto/Commodity Details", "url": "/alternative-assets/{asset_id}", "params": ["asset_id"]},
+        {"label": "Get Alternative Market Data", "url": "/alternative-assets/{asset_id}/market", "params": ["asset_id"]},
+    ],
+    "Alerts & Activities": [
+        {"label": "Get Company Alerts", "url": "/companies/{company_id}/alerts", "params": ["company_id"]},
+        {"label": "Get Key Developments", "url": "/companies/{company_id}/key-developments", "params": ["company_id"]},
+        {"label": "Get Earnings Call Recaps", "url": "/companies/{company_id}/earnings-call/{year_quarter}/recaps", "params": ["company_id", "year_quarter"]},
+    ]
+}
+
+# --- 2. CONFIGURATION & HELPERS ---
+
 st.set_page_config(page_title="Bulk API Tool", layout="wide")
 st.title("🚀 Bulk API Enricher")
 
-# --- SESSION STATE ---
-# Store the list of configured API steps
 if "api_steps" not in st.session_state:
     st.session_state.api_steps = []
-
-# Store the loaded Swagger definition
-if "swagger_endpoints" not in st.session_state:
-    st.session_state.swagger_endpoints = {}
-
-# --- HELPER FUNCTIONS ---
 
 def get_headers(token):
     return {
@@ -34,82 +79,38 @@ def load_csv(file):
         file.seek(0)
         return pd.read_csv(file, encoding='latin1')
 
-def parse_swagger(file):
-    """
-    Parses a Swagger/OpenAPI JSON file to extract GET endpoints and their parameters.
-    """
-    try:
-        data = json.load(file)
-        endpoints = {}
-        
-        paths = data.get('paths', {})
-        for path, methods in paths.items():
-            if 'get' in methods:
-                details = methods['get']
-                summary = details.get('summary', details.get('operationId', path))
-                
-                # Extract parameters (path variables like {id})
-                params = []
-                # Check path level parameters
-                if 'parameters' in methods:
-                    for p in methods['parameters']:
-                        if p.get('in') == 'path':
-                            params.append(p['name'])
-                # Check method level parameters
-                if 'parameters' in details:
-                    for p in details['parameters']:
-                        if p.get('in') == 'path':
-                            params.append(p['name'])
-                
-                # Find distinct path params from URL string if not explicitly listed
-                matches = re.findall(r"\{(.*?)\}", path)
-                for m in matches:
-                    if m not in params:
-                        params.append(m)
-
-                label = f"{summary} ({path})"
-                endpoints[label] = {
-                    "url": path,
-                    "params": list(set(params)), # unique
-                    "description": details.get('description', "")
-                }
-        return endpoints
-    except Exception as e:
-        st.error(f"Error parsing Swagger file: {e}")
-        return {}
-
 def process_single_row(row, api_steps, base_url, headers, debug=False):
     """
-    Processes a single row through ALL configured API steps.
+    Processes a single row through configured API steps.
+    Returns the enriched dictionary.
     """
-    # Normalize row to dict if it's a pandas Series
+    # 1. Convert Row to Dict Safely
     if hasattr(row, 'to_dict'):
         row_data = row.to_dict()
     else:
-        row_data = row.copy()
+        row_data = dict(row)
 
     debug_log = []
     
-    # Iterate through each configured API step
+    # 2. Iterate Configured Steps
     for step_index, step in enumerate(api_steps):
         try:
-            # 1. Build URL
-            # We take the template and replace {param} with the value from the mapped CSV column
+            # Prepare URL
             url_path = step['url_template']
             
-            # Map parameters
-            # param_map looks like: {'company_id': 'CSV_Column_A'}
+            # Map Parameters (e.g. {company_id} -> 12345)
             for param_name, csv_col in step['param_map'].items():
                 if csv_col and csv_col in row_data:
                     val = str(row_data[csv_col]) if pd.notna(row_data[csv_col]) else ""
                     url_path = url_path.replace(f"{{{param_name}}}", val)
             
+            # Handle query params if needed (simple implementation just checks basics)
             full_url = base_url.rstrip('/') + '/' + url_path.lstrip('/')
 
             if debug:
                 debug_log.append(f"**Step {step_index+1} ({step['name']}):** `GET {full_url}`")
 
-            # 2. Call API
+            # Call API
             resp = requests.get(full_url, headers=headers)
             
             if debug:
@@ -118,30 +119,35 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
             if resp.status_code == 200:
                 data = resp.json()
                 
-                # Handle Array responses
+                # Normalize response (Array -> Object if needed)
                 if isinstance(data, list):
                     data = data[0] if len(data) > 0 else {}
                 
                 if debug:
-                    json_preview = json.dumps(data, indent=2)[:500]
-                    debug_log.append(f"```json\n{json_preview}\n```")
+                    json_preview = json.dumps(data, indent=2)[:300]
+                    debug_log.append(f"```json\n{json_preview}...\n```")
 
-                # 3. Extract Outputs
-                # output_map is a list of dicts: [{'json_field': 'score', 'csv_column': 'Score'}]
+                # Extract Requested Fields
                 for mapping in step['output_map']:
                     j_field = mapping['json_field']
                     c_col = mapping['csv_column']
                     
                     if j_field and c_col:
-                        val = data.get(j_field, "")
-                        # Save to row_data so next steps can potentially use it, and for final CSV
+                        # Support nested fields via dot notation e.g. "data.score"
+                        val = data
+                        for key in j_field.split('.'):
+                            if isinstance(val, dict):
+                                val = val.get(key, "")
+                            else:
+                                val = ""
+                        
                         row_data[c_col] = val
                         if debug:
-                            debug_log.append(f"✅ Extracted `{j_field}` -> `{val}`")
+                            debug_log.append(f"✅ Map `{j_field}` -> `{val}`")
             else:
                 if debug:
                     debug_log.append(f"❌ Failed: {resp.text}")
-                # Fill empties
+                # Fill mapped columns with empty string on failure
                 for mapping in step['output_map']:
                     if mapping['csv_column']:
                         row_data[mapping['csv_column']] = ""
@@ -149,6 +155,7 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
         except Exception as e:
             if debug:
                 debug_log.append(f"❌ Exception: {str(e)}")
+            # Fill mapped columns with empty string on crash
             for mapping in step['output_map']:
                 if mapping['csv_column']:
                     row_data[mapping['csv_column']] = ""
@@ -157,118 +164,119 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
         return debug_log
     return row_data
 
-# --- UI LAYOUT ---
+# --- 3. UI: SIDEBAR ---
 
 with st.sidebar:
-    st.header("1. Setup")
+    st.header("Authentication")
+    token_input = st.text_input("Access Token", type="password", placeholder="Paste your token here")
     base_url = st.text_input("Base URL", value="https://rest.bridgewise.com")
-    token_input = st.text_input("Access Token", type="password")
     
     st.divider()
-    st.subheader("Optional: Swagger")
-    swagger_file = st.file_uploader("Upload swagger.json to auto-fill endpoints", type=['json'])
-    if swagger_file:
-        st.session_state.swagger_endpoints = parse_swagger(swagger_file)
-        st.success(f"Loaded {len(st.session_state.swagger_endpoints)} endpoints.")
+    st.markdown("**Instructions:**")
+    st.markdown("1. Upload CSV")
+    st.markdown("2. Select API Category & Endpoint")
+    st.markdown("3. Map columns")
+    st.markdown("4. Run")
 
-col_main, col_preview = st.columns([2, 1])
+# --- 4. UI: MAIN AREA ---
+
+col_main, col_dummy = st.columns([3, 1])
 
 with col_main:
-    st.header("2. Input Data")
-    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+    uploaded_file = st.file_uploader("1. Upload Input CSV", type=["csv"])
 
 if uploaded_file and token_input:
+    # Load CSV Headers
     df = load_csv(uploaded_file)
     csv_headers = df.columns.tolist()
     
+    # Determine Output Name
+    input_name = os.path.splitext(uploaded_file.name)[0]
+    output_name = f"{input_name}_output.csv"
+
     st.divider()
-    st.header("3. Configure API Steps")
-    st.info("You can add multiple API calls. They will run in order for every row.")
-
-    # --- STEP CONFIGURATOR ---
-    with st.expander("➕ Add New API Step", expanded=True):
+    st.subheader("2. Build API Pipeline")
+    
+    # --- PIPELINE BUILDER ---
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            category = st.selectbox("Select API Category", options=list(API_DEFINITIONS.keys()))
+        with c2:
+            # Filter Endpoints based on Category
+            available_endpoints = API_DEFINITIONS[category]
+            endpoint_labels = [e['label'] for e in available_endpoints]
+            selected_label = st.selectbox("Select Endpoint", options=endpoint_labels)
         
-        # Endpoint Selection
-        if st.session_state.swagger_endpoints:
-            endpoint_options = list(st.session_state.swagger_endpoints.keys())
-            selected_label = st.selectbox("Select Endpoint", options=["Custom"] + endpoint_options)
-            
-            if selected_label != "Custom":
-                ep_data = st.session_state.swagger_endpoints[selected_label]
-                url_template = ep_data['url']
-                required_params = ep_data['params']
-            else:
-                url_template = st.text_input("URL Path (e.g. /companies/{id})", value="/companies/{id}")
-                required_params = [m.group(1) for m in re.finditer(r"\{(.*?)\}", url_template)]
-        else:
-            url_template = st.text_input("URL Path (e.g. /companies/{id}/analysis)", value="/companies/{id}/analysis")
-            required_params = [m.group(1) for m in re.finditer(r"\{(.*?)\}", url_template)]
+        # Get selected endpoint details
+        selected_endpoint = next(e for e in available_endpoints if e['label'] == selected_label)
+        
+        st.caption(f"Endpoint URL: `{selected_endpoint['url']}`")
 
-        st.caption(f"Path: `{url_template}`")
-
-        # Parameter Mapping
-        st.subheader("Map URL Parameters")
+        # Dynamic Param Mapping
         param_map = {}
-        if required_params:
-            cols = st.columns(len(required_params))
-            for i, p in enumerate(required_params):
-                with cols[i % len(cols)]:
-                    # Try to find a matching header automatically
+        if selected_endpoint['params']:
+            st.markdown("**Map URL Parameters:**")
+            p_cols = st.columns(len(selected_endpoint['params']))
+            for i, p in enumerate(selected_endpoint['params']):
+                with p_cols[i]:
+                    # Smart Auto-select
                     default_idx = 0
-                    if p in csv_headers:
-                        default_idx = csv_headers.index(p)
-                    elif "company_id" in csv_headers:
-                         default_idx = csv_headers.index("company_id")
+                    if p in csv_headers: default_idx = csv_headers.index(p)
+                    elif "company_id" in csv_headers and "id" in p: default_idx = csv_headers.index("company_id")
                     
-                    param_map[p] = st.selectbox(f"Value for '{{{p}}}'", options=csv_headers, index=default_idx, key=f"param_{p}")
-        else:
-            st.write("No parameters detected in URL.")
-
-        # Output Mapping
-        st.subheader("Define Outputs")
-        # Initialize default dataframe for editor
-        default_data = [{"json_field": "score", "csv_column": "analysis_score"}]
-        edited_df = st.data_editor(
-            default_data, 
+                    param_map[p] = st.selectbox(f"CSV Column for {{{p}}}", options=csv_headers, index=default_idx)
+        
+        # Output Config
+        st.markdown("**Extract Data:**")
+        default_outputs = [
+            {"json_field": "analysis_score", "csv_column": "Score"},
+            {"json_field": "analysis_score_group_text", "csv_column": "Recommendation"}
+        ]
+        
+        edited_outputs = st.data_editor(
+            default_outputs, 
             num_rows="dynamic",
             column_config={
-                "json_field": st.column_config.TextColumn("JSON Field (API)", required=True),
-                "csv_column": st.column_config.TextColumn("New Column Name (CSV)", required=True)
+                "json_field": st.column_config.TextColumn("JSON Field (from API)", required=True),
+                "csv_column": st.column_config.TextColumn("Output Column Name", required=True)
             },
-            key="editor_new_step"
+            use_container_width=True,
+            key="new_step_editor"
         )
 
-        if st.button("Save Step"):
+        if st.button("➕ Add This Step to Pipeline", type="secondary"):
             new_step = {
-                "name": selected_label if st.session_state.swagger_endpoints else "Custom API",
-                "url_template": url_template,
+                "name": selected_endpoint['label'],
+                "url_template": selected_endpoint['url'],
                 "param_map": param_map,
-                "output_map": edited_df
+                "output_map": edited_outputs
             }
             st.session_state.api_steps.append(new_step)
-            st.success("Step added! You can add more or scroll down to run.")
+            st.success("Step Added!")
 
-    # --- SHOW CONFIGURED STEPS ---
+    # --- PIPELINE REVIEW ---
     if st.session_state.api_steps:
-        st.subheader("Pipeline Review")
+        st.markdown("### Active Pipeline")
         for i, step in enumerate(st.session_state.api_steps):
-            with st.expander(f"Step {i+1}: {step['name']} ({step['url_template']})"):
-                st.write("**Parameters:**", step['param_map'])
-                st.write("**Outputs:**", pd.DataFrame(step['output_map']))
-                if st.button(f"Remove Step {i+1}", key=f"rm_{i}"):
+            with st.expander(f"Step {i+1}: {step['name']}", expanded=True):
+                st.write(f"**URL:** `{step['url_template']}`")
+                st.write(f"**Params:** `{step['param_map']}`")
+                st.dataframe(pd.DataFrame(step['output_map']), hide_index=True)
+                if st.button("Remove Step", key=f"rm_{i}"):
                     st.session_state.api_steps.pop(i)
                     st.rerun()
 
     # --- EXECUTION ---
     st.divider()
-    st.header("4. Execution")
+    st.subheader("3. Run Process")
     
-    col_act1, col_act2 = st.columns([1, 3])
+    act1, act2 = st.columns([1, 4])
     
-    with col_act1:
+    with act1:
         if st.button("🔍 Test 1 Row"):
             if not st.session_state.api_steps:
-                st.error("Please add at least one API step above.")
+                st.error("Please add at least one step above.")
             else:
                 first_row = df.iloc[0]
                 logs = process_single_row(
@@ -278,25 +286,24 @@ if uploaded_file and token_input:
                     get_headers(token_input), 
                     debug=True
                 )
-                with st.container():
-                    st.write("### Test Results")
+                with st.expander("View Diagnostic Logs", expanded=True):
                     for log in logs:
                         st.markdown(log)
 
-    with col_act2:
+    with act2:
         if st.button("🚀 Process Full File", type="primary"):
             if not st.session_state.api_steps:
-                st.error("Add API steps first.")
+                st.error("Please add at least one step above.")
             else:
-                total_rows = len(df)
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                results = []
                 
+                results = []
+                total = len(df)
+                
+                # Execute in parallel
                 with ThreadPoolExecutor(max_workers=5) as executor:
-                    # Convert to dict records for processing
-                    rows_input = df.to_dict('records')
-                    
+                    input_rows = df.to_dict('records')
                     futures = [
                         executor.submit(
                             process_single_row, 
@@ -305,7 +312,7 @@ if uploaded_file and token_input:
                             base_url, 
                             get_headers(token_input), 
                             False
-                        ) for row in rows_input
+                        ) for row in input_rows
                     ]
                     
                     for i, f in enumerate(futures):
@@ -313,22 +320,30 @@ if uploaded_file and token_input:
                             res = f.result()
                             results.append(res)
                         except Exception as e:
-                            # Fallback if critical failure, append original
-                            results.append(rows_input[i])
-                            st.error(f"Row {i} failed: {e}")
+                            # Safety: If a thread crashes, append original row with error note (or just original)
+                            err_row = input_rows[i].copy()
+                            err_row['ERROR_LOG'] = str(e)
+                            results.append(err_row)
+                        
+                        if i % 5 == 0:
+                            progress_bar.progress((i + 1) / total)
+                            status_text.text(f"Processed {i + 1}/{total} rows")
 
-                        if i % 10 == 0:
-                            progress_bar.progress((i + 1) / total_rows)
-                            status_text.text(f"Processed {i + 1}/{total_rows}")
-                
                 progress_bar.progress(100)
-                status_text.text("Done!")
+                status_text.text("Processing Complete!")
                 
                 final_df = pd.DataFrame(results)
-                st.success(f"Completed! {len(final_df)} rows enriched.")
                 
+                # CSV Download
                 csv_data = final_df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Result", csv_data, "enriched.csv", "text/csv")
+                st.download_button(
+                    label=f"📥 Download {output_name}",
+                    data=csv_data,
+                    file_name=output_name,
+                    mime="text/csv"
+                )
 
-else:
-    st.info("Upload CSV and provide Token to start.")
+elif not uploaded_file:
+    st.info("Waiting for CSV upload...")
+elif not token_input:
+    st.warning("Please enter your Access Token in the sidebar.")
