@@ -2,162 +2,237 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Bulk API Runner", layout="wide")
+st.set_page_config(page_title="Bulk API Tool", layout="wide")
 
+# --- HEADER & TOKEN ---
 st.title("🚀 Bulk API Enricher")
-st.markdown("Upload a CSV, provide your Config & Token, and enrich your data.")
 
-# --- SIDEBAR: CONFIGURATION ---
-with st.sidebar:
-    st.header("1. Configuration")
+# Split top section: File Upload (Left) and Token (Right)
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    uploaded_file = st.file_uploader("1. Upload CSV", type=["csv"])
+
+with col2:
+    # UX: Plain text input, no 'Bearer' placeholder needed
+    token_input = st.text_input("2. API Token", placeholder="Paste your token here (ey...)", help="We automatically add 'Bearer ' for you.")
+
+# --- CONFIGURATION (Hidden by default for better UX) ---
+# We keep the logic in the code, but allow power users to open this if needed.
+with st.expander("⚙️ Advanced Configuration (API Mappings)", expanded=False):
+    st.info("Edit this only if you need to change endpoints or output fields.")
     
-    # Default Config Template
     default_config = {
         "baseUrl": "https://rest.bridgewise.com",
-        "authHeader": "Authorization",
         "concurrency": 5,
         "input": {
+            # We will try to auto-detect ID columns, but this is the fallback
             "idColumn": "company_id",
-            "keepColumns": ["company_id", "Company_name"]
+            "keepColumns": ["company_id", "Company_name", "ticker_symbol"]
         },
         "apis": [
             {
                 "name": "analysis",
                 "urlTemplate": "/companies/{company_id}/analysis?language=en-US",
-                "outputs": [{"column": "score", "field": "analysis_score"}]
+                "outputs": [
+                    { "column": "score", "field": "analysis_score" },
+                    { "column": "industry_median", "field": "analysis_score_industry_median" }
+                ]
             }
         ],
-        "outputColumns": ["company_id", "Company_name", "score"]
+        "outputColumns": ["company_id", "Company_name", "ticker_symbol", "score", "industry_median"]
+    }
+    config_input = st.text_area("JSON Logic", value=json.dumps(default_config, indent=2), height=300)
+
+# --- HELPER FUNCTIONS ---
+
+def get_headers(token):
+    # UX: Auto-add Bearer
+    clean_token = token.strip()
+    return {
+        "Authorization": f"Bearer {clean_token}",
+        "Accept": "application/json"
     }
 
-    token = st.text_input("API Token", type="password", placeholder="Bearer eyJ...")
-    config_input = st.text_area("JSON Configuration", value=json.dumps(default_config, indent=2), height=300)
+def load_csv(file):
+    try:
+        return pd.read_csv(file)
+    except UnicodeDecodeError:
+        file.seek(0)
+        return pd.read_csv(file, encoding='latin1')
 
-# --- MAIN: FILE UPLOAD ---
-st.header("2. Input Data")
-uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
-
-# --- PROCESSING ENGINE ---
-def call_api(row, config, headers):
+def process_row(row, config, headers, debug_mode=False):
+    """
+    Processes a single row. 
+    If debug_mode=True, returns a log of what happened instead of the result row.
+    """
     result_row = {}
-    
-    # Keep original columns
+    debug_log = []
+
+    # 1. Copy original columns defined in config
     for col in config['input'].get('keepColumns', []):
         result_row[col] = row.get(col, "")
 
-    # Iterate APIs
+    # 2. Loop through APIs
     for api in config['apis']:
         try:
-            # URL Substitution
+            # URL Construction
             url = config['baseUrl'] + api['urlTemplate']
-            for col in row.index:
-                placeholder = "{" + str(col) + "}"
-                if placeholder in url:
-                    val_to_sub = str(row[col]) if pd.notna(row[col]) else ""
-                    url = url.replace(placeholder, val_to_sub)
             
-            # Request
+            # Replace placeholders
+            for col_name in row.index:
+                placeholder = "{" + str(col_name) + "}"
+                if placeholder in url:
+                    val = str(row[col_name]) if pd.notna(row[col_name]) else ""
+                    url = url.replace(placeholder, val)
+
+            if debug_mode:
+                debug_log.append(f"**Request:** `GET {url}`")
+
+            # Call API
             resp = requests.get(url, headers=headers)
+            
+            if debug_mode:
+                debug_log.append(f"**Status:** {resp.status_code}")
             
             if resp.status_code == 200:
                 data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    data = data[0]
-                elif isinstance(data, list):
-                    data = {}
                 
-                # Extract fields
+                # Debug: Show the first part of the JSON
+                if debug_mode:
+                    debug_log.append("**Raw JSON Response:**")
+                    debug_log.append(data)
+
+                # Normalize Array vs Object
+                if isinstance(data, list):
+                    data = data[0] if len(data) > 0 else {}
+                
+                # Extract Fields
                 for output in api['outputs']:
-                    field_val = data.get(output['field'], "")
-                    result_row[output['column']] = field_val
-            else:
-                # Fill empty if failed
-                for output in api['outputs']:
-                    result_row[output['column']] = ""
+                    field_key = output['field']
+                    val = data.get(field_key, None)
                     
-        except Exception as e:
-            # Fill empty on error
-             for output in api['outputs']:
+                    if debug_mode:
+                        debug_log.append(f"👉 Looking for field `'{field_key}'` -> Found: `{val}`")
+
+                    # If val is still None or empty, output is empty string
+                    result_row[output['column']] = val if val is not None else ""
+            else:
+                if debug_mode:
+                    debug_log.append(f"❌ API Failed. Response: {resp.text}")
+                # Fill empty on failure
+                for output in api['outputs']:
                     result_row[output['column']] = ""
 
+        except Exception as e:
+            if debug_mode:
+                debug_log.append(f"❌ Exception: {str(e)}")
+            for output in api['outputs']:
+                result_row[output['column']] = ""
+
+    if debug_mode:
+        return debug_log
     return result_row
 
-# --- RUN BUTTON ---
-if st.button("Start Processing", type="primary"):
-    if not token or not uploaded_file:
-        st.error("Please provide both an API Token and a CSV file.")
-    else:
-        try:
-            # --- FIX: Try loading CSV with UTF-8, fallback to Latin-1 if that fails ---
-            try:
-                df = pd.read_csv(uploaded_file)
-            except UnicodeDecodeError:
-                uploaded_file.seek(0) # Reset file pointer
-                df = pd.read_csv(uploaded_file, encoding='latin1')
-            # ------------------------------------------------------------------------
+# --- MAIN UI ACTIONS ---
 
-            config = json.loads(config_input)
-            
-            headers = {"Accept": "application/json"}
-            if config.get("authHeader"):
-                headers[config.get("authHeader")] = token
+st.divider()
 
-            total_rows = len(df)
-            st.info(f"Loaded {total_rows} rows. Processing...")
+if not uploaded_file or not token_input:
+    st.warning("waiting for file and token...")
+else:
+    # Parse Config & File
+    try:
+        config = json.loads(config_input)
+        df = load_csv(uploaded_file)
+        headers = get_headers(token_input)
+        
+        # --- ACTION 1: TEST BUTTON (DEBUGGING) ---
+        st.subheader("3. Validation")
+        if st.button("🔍 Test Run (Process 1st Row Only)"):
+            st.write("Running diagnostic on the first row of your CSV...")
             
+            first_row = df.iloc[0]
+            st.markdown(f"**Input Row Data:** `{first_row.to_dict()}`")
+            
+            # Run with debug mode ON
+            logs = process_row(first_row, config, headers, debug_mode=True)
+            
+            # Display Logs
+            for log in logs:
+                if isinstance(log, dict) or isinstance(log, list):
+                    st.json(log)
+                else:
+                    st.markdown(log)
+                    
+            st.success("Test complete. Check the logs above to see if the data was found.")
+
+        # --- ACTION 2: BULK RUN ---
+        st.subheader("4. Bulk Processing")
+        if st.button("🚀 Start Full Processing", type="primary"):
+            
+            status_area = st.empty()
             progress_bar = st.progress(0)
-            status_text = st.empty()
+            error_log = []
             
             results = []
-            
-            # Concurrency
+            total_rows = len(df)
             concurrency = config.get("concurrency", 5)
-            
+
+            status_area.text(f"Starting worker pool with {concurrency} threads...")
+
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                # Prepare rows as list of dicts
                 rows = df.to_dict('records')
+                futures = [executor.submit(process_row, row, config, headers) for row in rows]
                 
-                # Submit jobs
-                futures = [executor.submit(call_api, row, config, headers) for row in rows]
-                
-                # Collect results
                 for i, future in enumerate(futures):
-                    results.append(future.result())
+                    try:
+                        res = future.result()
+                        results.append(res)
+                    except Exception as e:
+                        error_log.append(f"Row {i} failed: {str(e)}")
                     
                     # Update UI
-                    if i % 5 == 0 or i == total_rows - 1:
-                        progress = (i + 1) / total_rows
-                        progress_bar.progress(progress)
-                        status_text.text(f"Processed {i + 1}/{total_rows}")
+                    if i % 10 == 0 or i == total_rows - 1:
+                        progress_bar.progress((i + 1) / total_rows)
+                        status_area.text(f"Processed {i + 1}/{total_rows}")
 
-            # Create DataFrame
+            # Finalize
+            if error_log:
+                st.error(f"Completed with {len(error_log)} errors.")
+                with st.expander("View Errors"):
+                    for err in error_log[:20]:
+                        st.write(err)
+            else:
+                st.success("Done! No errors reported.")
+
+            # Output DataFrame
             result_df = pd.DataFrame(results)
             
-            # Reorder columns based on config
-            final_cols = config.get("outputColumns", result_df.columns.tolist())
-            # Ensure all columns exist
+            # Ensure column order
+            final_cols = config.get("outputColumns", [])
+            # Add missing columns if any
             for col in final_cols:
                 if col not in result_df.columns:
                     result_df[col] = ""
             
-            result_df = result_df[final_cols]
+            # Filter to only requested columns
+            if final_cols:
+                result_df = result_df[final_cols]
 
-            st.success("Processing Complete!")
-            
-            # Download Button
-            csv = result_df.to_csv(index=False).encode('utf-8')
+            # Download
+            csv_data = result_df.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="Download Enriched CSV",
-                data=csv,
-                file_name="enriched_output.csv",
-                mime="text/csv",
+                label="📥 Download Result CSV",
+                data=csv_data,
+                file_name="enriched_data.csv",
+                mime="text/csv"
             )
 
-        except json.JSONDecodeError:
-            st.error("Invalid JSON in Configuration box.")
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
+    except json.JSONDecodeError:
+        st.error("Your Configuration JSON is invalid. Please check the 'Advanced Configuration' section.")
+    except Exception as e:
+        st.error(f"Critical Error: {str(e)}")
