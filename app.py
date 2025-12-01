@@ -57,7 +57,8 @@ def call_api(row, config, headers):
             for col in row.index:
                 placeholder = "{" + str(col) + "}"
                 if placeholder in url:
-                    url = url.replace(placeholder, str(row[col]))
+                    val_to_sub = str(row[col]) if pd.notna(row[col]) else ""
+                    url = url.replace(placeholder, val_to_sub)
             
             # Request
             resp = requests.get(url, headers=headers)
@@ -91,8 +92,14 @@ if st.button("Start Processing", type="primary"):
         st.error("Please provide both an API Token and a CSV file.")
     else:
         try:
-            # Load Data
-            df = pd.read_csv(uploaded_file)
+            # --- FIX: Try loading CSV with UTF-8, fallback to Latin-1 if that fails ---
+            try:
+                df = pd.read_csv(uploaded_file)
+            except UnicodeDecodeError:
+                uploaded_file.seek(0) # Reset file pointer
+                df = pd.read_csv(uploaded_file, encoding='latin1')
+            # ------------------------------------------------------------------------
+
             config = json.loads(config_input)
             
             headers = {"Accept": "application/json"}
@@ -121,7 +128,7 @@ if st.button("Start Processing", type="primary"):
                 for i, future in enumerate(futures):
                     results.append(future.result())
                     
-                    # Update UI every 10 rows or so to save render time
+                    # Update UI
                     if i % 5 == 0 or i == total_rows - 1:
                         progress = (i + 1) / total_rows
                         progress_bar.progress(progress)
