@@ -2,24 +2,24 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
+import time
 import re
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. EXACT SWAGGER DEFINITION (Parsed from your provided JSON) ---
+# --- 1. COMPREHENSIVE SWAGGER DEFINITION (Extracted from provided JSON) ---
 SWAGGER_SPECS = {
     "Fundamental Analysis": {
         "/companies/{company_id}/fundamental-analysis": {
             "label": "Get Fundamental Analysis",
             "path": ["company_id"],
-            "query": ["language", "show_all"],
+            "query": ["language", "show_all", "year", "quarter"],
             "defaults": [{"json_field": "analysis_score", "csv_column": "Fundamental Score"}]
         },
         "/companies/{company_id}/fundamental-sections": {
             "label": "Get Fundamental Sections",
             "path": ["company_id"],
-            "query": ["language", "section_type", "show_all"],
+            "query": ["language", "section_type", "show_all", "year", "quarter"],
             "defaults": [{"json_field": "section_score", "csv_column": "Section Score"}]
         },
         "/companies/{company_id}/fundamental-parameters": {
@@ -27,6 +27,12 @@ SWAGGER_SPECS = {
             "path": ["company_id"],
             "query": ["language", "section_type", "has_score", "year", "quarter", "period_type", "parameter_id", "limit", "show_all"],
             "defaults": [{"json_field": "parameter_value", "csv_column": "Param Value"}]
+        },
+        "/companies/{company_id}/fundamental-paragraphs": {
+            "label": "Get Fundamental Paragraphs",
+            "path": ["company_id"],
+            "query": ["language", "section_type"],
+            "defaults": [{"json_field": "paragraph", "csv_column": "Analysis Text"}]
         },
         "/companies/{company_id}/target-price": {
             "label": "Get Target Price",
@@ -81,14 +87,37 @@ SWAGGER_SPECS = {
             "defaults": [{"json_field": "analysis_score", "csv_column": "Alt Score"}]
         }
     },
-    "Company Metadata & Search": {
+    "Company Search & Metadata": {
         "/companies": {
             "label": "Search Companies (Filter)",
             "path": [],
             "query": [
-                "language", "search", "peers_of", "region_id", "incorporation_country_id", 
+                "search", "language", "peers_of", "region_id", "incorporation_country_id", 
                 "domicile_country_id", "gics_sector_id", "gics_industry_group_id", "gics_industry_id",
-                "theme_id", "implied_market_cap__gte", "implied_market_cap__lte", "exchange_id",
+                "csa_industry_id", "theme_id", "exchange_id", "currency_market_id", "fund_id", "tenant_id",
+                "implied_market_cap__gte", "implied_market_cap__lte", 
+                "last_close_market_cap_usd__gte", "last_close_market_cap_usd__lte",
+                "assets_turnover__gte", "assets_turnover__lte",
+                "average_revenue_per_subscriber__gte", "average_revenue_per_subscriber__lte",
+                "pe_ratio__gte", "pe_ratio__lte", "current_ratio__gte", "current_ratio__lte",
+                "dividend_yield_percentage__gte", "dividend_yield_percentage__lte",
+                "ebitda_margin_percent__gte", "ebitda_margin_percent__lte",
+                "ebit_by_interest_expense__gte", "ebit_by_interest_expense__lte",
+                "free_cash_flow_per_share__gte", "free_cash_flow_per_share__lte",
+                "gross_profit_margin_percent__gte", "gross_profit_margin_percent__lte",
+                "net_eps_basic__gte", "net_eps_basic__lte",
+                "net_debt_divided_by_ebitda__gte", "net_debt_divided_by_ebitda__lte",
+                "return_on_equity_percent__gte", "return_on_equity_percent__lte",
+                "return_on_assets__gte", "return_on_assets__lte",
+                "total_debt_to_equity__gte", "total_debt_to_equity__lte",
+                "total_revenues__gte", "total_revenues__lte",
+                "beta_1_year__gte", "beta_1_year__lte",
+                "analysis_fundamental_score__gte", "analysis_fundamental_score__lte",
+                "analysis_esg_score__gte", "analysis_esg_score__lte",
+                "analysis_technical_score__gte", "analysis_technical_score__lte",
+                "news_sentiment__gte", "news_sentiment__lte",
+                "target_price_to_last_close__gte", "target_price_to_last_close__lte",
+                "internal_coverage", "policy_threshold", "scoring_method",
                 "sort_by", "page", "page_size"
             ],
             "defaults": [{"json_field": "company_name", "csv_column": "Company Name"}]
@@ -133,6 +162,18 @@ SWAGGER_SPECS = {
             "query": ["published_date__gte", "published_date__lte", "language"],
             "defaults": [{"json_field": "average_sentiment_score", "csv_column": "News Sentiment"}]
         },
+        "/companies/{company_id}/alerts": {
+            "label": "Get Alerts",
+            "path": ["company_id"],
+            "query": ["language", "alert_type", "sentiment", "importance"],
+            "defaults": [{"json_field": "headline", "csv_column": "Alert"}]
+        },
+        "/companies/{company_id}/key-developments": {
+            "label": "Get Key Developments",
+            "path": ["company_id"],
+            "query": ["language", "importance"],
+            "defaults": [{"json_field": "headline", "csv_column": "Development"}]
+        },
         "/companies/{company_id}/earnings-call/{year_quarter}/recaps": {
             "label": "Get Earnings Recaps",
             "path": ["company_id", "year_quarter"],
@@ -144,7 +185,25 @@ SWAGGER_SPECS = {
         "/funds": {
             "label": "Search Funds",
             "path": [],
-            "query": ["search", "sort_by", "language", "sponsor_id", "vehicle_type", "page", "page_size"],
+            "query": [
+                "search", "sort_by", "language", "sponsor_id", "vehicle_type", "management_style_id", 
+                "market_cap_emphasis_id", "sector_emphasis_id", "geography_emphasis_id", "exposure_id",
+                "leverage", "leverage__not_in", "market_benchmark_id", "primary_benchmark_id",
+                "has_score", "currency_market_id", "exchange_id", "theme_id", "peers_of",
+                "pct_of_equity_holdings__gte", "pct_of_equity_holdings__lte",
+                "beta_1y__gte", "beta_1y__lte", "tracking_error_1y__gte", "tracking_error_1y__lte",
+                "expense_ratio__gte", "expense_ratio__lte",
+                "avg_trading_volume_3m__gte", "avg_trading_volume_3m__lte",
+                "trading_volume_ratio__gte", "trading_volume_ratio__lte",
+                "largest_holding__gte", "largest_holding__lte",
+                "sharpe_ratio_1y__gte", "sharpe_ratio_1y__lte",
+                "alpha_1y__gte", "alpha_1y__lte",
+                "dividend_yield__gte", "dividend_yield__lte",
+                "aum_usd__gte", "aum_usd__lte",
+                "sponsor_aum_usd__gte", "sponsor_aum_usd__lte",
+                "analysis_fundamental_score__gte", "analysis_fundamental_score__lte",
+                "page", "page_size"
+            ],
             "defaults": [{"json_field": "fund_name", "csv_column": "Fund Name"}]
         },
         "/funds/{fund_id}": {
@@ -184,7 +243,7 @@ st.markdown("""
         height: 50px; background-color: #f0f2f6; border-radius: 4px 4px 0px 0px; padding-top: 10px;
     }
     .stTabs [aria-selected="true"] { background-color: #ffffff; border-top: 2px solid #ff4b4b; }
-    .step-card { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 10px; background-color: #f9f9f9; }
+    div[data-testid="stExpander"] div[role="button"] p { font-size: 1rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -205,21 +264,13 @@ def load_csv(file):
         return pd.read_csv(file, encoding='latin1')
 
 def resolve_value(val, row_data):
-    """
-    If val contains {ColName}, replace it with row data.
-    Otherwise return val as is.
-    """
     if not val: return None
-    
-    # Check for {Column} pattern
-    match = re.search(r"\{(.*?)\}", val)
+    match = re.search(r"\{(.*?)\}", str(val))
     if match:
         col_name = match.group(1)
-        # Check if this column exists in the row
         if col_name in row_data:
             clean_val = str(row_data[col_name])
-            return val.replace(match.group(0), clean_val)
-    
+            return str(val).replace(match.group(0), clean_val)
     return val
 
 def process_single_row(row, api_steps, base_url, headers, debug=False):
@@ -232,14 +283,14 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
         try:
             url_path = step['url_template']
             
-            # 1. Resolve Path Params (Mandatory)
+            # 1. Resolve Path Params
             for param_name, csv_col in step['path_map'].items():
                 val = str(row_data.get(csv_col, ""))
                 url_path = url_path.replace(f"{{{param_name}}}", val)
             
             full_url = base_url.rstrip('/') + '/' + url_path.lstrip('/')
             
-            # 2. Resolve Query Params (Optional)
+            # 2. Resolve Query Params
             query_payload = {}
             for q_key, q_val in step['query_map'].items():
                 resolved = resolve_value(q_val, row_data)
@@ -249,8 +300,7 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
             if debug: 
                 debug_log.append(f"**Step: {step['name']}**")
                 debug_log.append(f"Request: `GET {full_url}`")
-                if query_payload:
-                    debug_log.append(f"Params: `{query_payload}`")
+                if query_payload: debug_log.append(f"Params: `{query_payload}`")
             
             # 3. Request
             resp = requests.get(full_url, headers=headers, params=query_payload)
@@ -260,7 +310,6 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
                 if isinstance(data, list): data = data[0] if len(data) > 0 else {}
                 
                 if debug: 
-                    # Truncate large responses for display
                     json_preview = json.dumps(data, indent=2)
                     if len(json_preview) > 500: json_preview = json_preview[:500] + "\n... (truncated)"
                     debug_log.append(f"Response (200 OK):")
@@ -272,12 +321,11 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
                     c_col = mapping['csv_column']
                     if j_field and c_col:
                         val = data
-                        # Handle dot notation e.g. "meta.count"
                         for key in j_field.split('.'):
                             if isinstance(val, dict): val = val.get(key, "")
                             else: val = ""
                         row_data[c_col] = val
-                        if debug: debug_log.append(f"👉 Extracted `{j_field}` -> Column `{c_col}`: `{val}`")
+                        if debug: debug_log.append(f"👉 Extracted `{j_field}` -> `{val}`")
             else:
                 if debug: debug_log.append(f"❌ Failed {resp.status_code}: {resp.text}")
                 for mapping in step['output_map']:
@@ -323,13 +371,10 @@ with tab_build:
             with st.container(border=True):
                 st.subheader("Add API Step")
                 
-                # Selection
+                # Endpoint Selector
                 cat_options = list(SWAGGER_SPECS.keys())
                 selected_cat = st.pills("Category", cat_options, selection_mode="single", default=cat_options[0])
-                
-                # Get endpoints for category
                 cat_endpoints = SWAGGER_SPECS[selected_cat]
-                # Create a lookup for label -> url
                 label_to_url = {v['label']: k for k, v in cat_endpoints.items()}
                 
                 selected_label = st.selectbox("Select Endpoint", list(label_to_url.keys()))
@@ -341,7 +386,7 @@ with tab_build:
                 # 1. PATH PARAMS (Mandatory)
                 path_map = {}
                 if ep_config.get('path'):
-                    st.markdown("##### 🔗 Path Parameters (Required)")
+                    st.markdown("##### 🔗 Path Parameters")
                     cols = st.columns(len(ep_config['path']))
                     for i, p in enumerate(ep_config['path']):
                         with cols[i]:
@@ -355,25 +400,41 @@ with tab_build:
                                     break
                             path_map[p] = st.selectbox(f"{{{p}}} mapped to:", st.session_state.csv_headers, index=def_idx, key=f"path_{p}")
 
-                # 2. QUERY PARAMS (Optional - Clutter Free)
+                # 2. QUERY PARAMS (Table Based Config)
                 query_map = {}
                 available_qs = ep_config.get('query', [])
                 
                 if available_qs:
-                    st.markdown("##### 🔍 Query Parameters (Optional)")
-                    # Multi-select to avoid clutter
-                    selected_qs = st.multiselect("Select parameters to configure:", available_qs)
+                    st.markdown("##### 🔍 Query Parameters")
+                    # Clean User Interface: Select params -> Edit Values in Table
+                    selected_qs = st.multiselect("Select optional parameters to add:", available_qs)
                     
                     if selected_qs:
-                        st.caption("Value can be static (e.g. `en-US`) OR dynamic from CSV (e.g. `{LanguageCol}`)")
-                        q_cols = st.columns(2)
-                        for idx, q in enumerate(selected_qs):
-                            with q_cols[idx % 2]:
-                                # Smart Default for language
-                                def_val = "en-US" if q == "language" else ""
-                                val = st.text_input(f"{q}", value=def_val, key=f"q_{q}")
-                                if val:
-                                    query_map[q] = val
+                        st.caption("Enter values below. Use `{ColumnName}` to use data from your CSV.")
+                        
+                        # Prepare data for editor
+                        default_q_data = []
+                        for q in selected_qs:
+                            # Pre-fill specific defaults
+                            val = "en-US" if q == "language" else ""
+                            default_q_data.append({"Parameter": q, "Value": val})
+                        
+                        # Data Editor for easy input
+                        edited_q_df = st.data_editor(
+                            default_q_data,
+                            column_config={
+                                "Parameter": st.column_config.TextColumn("Parameter", disabled=True),
+                                "Value": st.column_config.TextColumn("Value (Static or {Col})", required=True)
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                            key=f"q_editor_{selected_label}"
+                        )
+                        
+                        # Convert back to dict
+                        for _, row in pd.DataFrame(edited_q_df).iterrows():
+                            if row["Value"]:
+                                query_map[row["Parameter"]] = row["Value"]
 
                 # 3. OUTPUTS
                 st.markdown("##### 📤 Output Columns")
@@ -385,7 +446,7 @@ with tab_build:
                         "csv_column": st.column_config.TextColumn("New CSV Header", required=True)
                     },
                     use_container_width=True,
-                    key=f"editor_{selected_label}"
+                    key=f"out_editor_{selected_label}"
                 )
                 
                 if st.button("➕ Add to Pipeline", type="secondary", use_container_width=True):
@@ -408,7 +469,8 @@ with tab_build:
                 with st.expander(f"{i+1}. {step['name']}", expanded=False):
                     st.write(f"**Params:** {step['path_map']}")
                     if step['query_map']:
-                        st.write(f"**Query:** {step['query_map']}")
+                        st.write("**Query:**")
+                        st.json(step['query_map'])
                     st.write("**Outputs:**", [x['csv_column'] for x in step['output_map']])
                     if st.button("🗑️ Remove", key=f"rm_{i}"):
                         st.session_state.api_steps.pop(i)
