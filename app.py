@@ -1,238 +1,270 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
 from concurrent.futures import ThreadPoolExecutor
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Bulk API Tool", layout="wide")
-
-# --- HEADER & TOKEN ---
 st.title("🚀 Bulk API Enricher")
 
-# Split top section: File Upload (Left) and Token (Right)
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    uploaded_file = st.file_uploader("1. Upload CSV", type=["csv"])
-
-with col2:
-    # UX: Plain text input, no 'Bearer' placeholder needed
-    token_input = st.text_input("2. API Token", placeholder="Paste your token here (ey...)", help="We automatically add 'Bearer ' for you.")
-
-# --- CONFIGURATION (Hidden by default for better UX) ---
-# We keep the logic in the code, but allow power users to open this if needed.
-with st.expander("⚙️ Advanced Configuration (API Mappings)", expanded=False):
-    st.info("Edit this only if you need to change endpoints or output fields.")
-    
-    default_config = {
-        "baseUrl": "https://rest.bridgewise.com",
-        "concurrency": 5,
-        "input": {
-            # We will try to auto-detect ID columns, but this is the fallback
-            "idColumn": "company_id",
-            "keepColumns": ["company_id", "Company_name", "ticker_symbol"]
-        },
-        "apis": [
-            {
-                "name": "analysis",
-                "urlTemplate": "/companies/{company_id}/analysis?language=en-US",
-                "outputs": [
-                    { "column": "score", "field": "analysis_score" },
-                    { "column": "industry_median", "field": "analysis_score_industry_median" }
-                ]
-            }
-        ],
-        "outputColumns": ["company_id", "Company_name", "ticker_symbol", "score", "industry_median"]
-    }
-    config_input = st.text_area("JSON Logic", value=json.dumps(default_config, indent=2), height=300)
+# --- SESSION STATE INITIALIZATION ---
+# We store the output mappings in session state so they persist between clicks
+if "output_mappings" not in st.session_state:
+    # Default example mappings
+    st.session_state.output_mappings = [
+        {"json_field": "analysis_score", "csv_column_name": "score"},
+        {"json_field": "analysis_score_industry_median", "csv_column_name": "industry_median"},
+    ]
 
 # --- HELPER FUNCTIONS ---
-
 def get_headers(token):
-    # UX: Auto-add Bearer
-    clean_token = token.strip()
     return {
-        "Authorization": f"Bearer {clean_token}",
+        "Authorization": f"Bearer {token.strip()}",
         "Accept": "application/json"
     }
 
-def load_csv(file):
+def load_csv_headers(file):
+    """Reads just the first row to get headers safely"""
     try:
+        file.seek(0)
+        return pd.read_csv(file, nrows=0).columns.tolist()
+    except:
+        file.seek(0)
+        return pd.read_csv(file, nrows=0, encoding='latin1').columns.tolist()
+
+def load_full_csv(file):
+    """Reads the full CSV"""
+    try:
+        file.seek(0)
         return pd.read_csv(file)
-    except UnicodeDecodeError:
+    except:
         file.seek(0)
         return pd.read_csv(file, encoding='latin1')
 
-def process_row(row, config, headers, debug_mode=False):
+def resolve_url(base_url, template, row, id_col_name):
     """
-    Processes a single row. 
-    If debug_mode=True, returns a log of what happened instead of the result row.
+    Constructs the URL. 
+    It replaces {id} in the template with the value from the selected ID column.
     """
-    result_row = {}
+    # Combine Base + Template
+    full_url = base_url.rstrip('/') + '/' + template.lstrip('/')
+    
+    # Get the ID value from the row using the mapped column name
+    id_val = str(row[id_col_name]) if pd.notna(row[id_col_name]) else ""
+    
+    # Replace standard placeholder {id} with the actual value
+    # We allow the user to use {id} in the UI as a generic placeholder
+    target_url = full_url.replace("{id}", id_val)
+    
+    return target_url
+
+def process_single_row(row, id_col_name, base_url, url_template, mappings, headers, debug=False):
     debug_log = []
+    result_row = row.to_dict() # Start with existing data
+    
+    try:
+        # 1. Build URL
+        url = resolve_url(base_url, url_template, row, id_col_name)
+        
+        if debug:
+            debug_log.append(f"**Request:** `GET {url}`")
 
-    # 1. Copy original columns defined in config
-    for col in config['input'].get('keepColumns', []):
-        result_row[col] = row.get(col, "")
-
-    # 2. Loop through APIs
-    for api in config['apis']:
-        try:
-            # URL Construction
-            url = config['baseUrl'] + api['urlTemplate']
+        # 2. Call API
+        resp = requests.get(url, headers=headers)
+        
+        if debug:
+            debug_log.append(f"**Status:** {resp.status_code}")
             
-            # Replace placeholders
-            for col_name in row.index:
-                placeholder = "{" + str(col_name) + "}"
-                if placeholder in url:
-                    val = str(row[col_name]) if pd.notna(row[col_name]) else ""
-                    url = url.replace(placeholder, val)
-
-            if debug_mode:
-                debug_log.append(f"**Request:** `GET {url}`")
-
-            # Call API
-            resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
             
-            if debug_mode:
-                debug_log.append(f"**Status:** {resp.status_code}")
+            # Handle Array responses (take first item)
+            if isinstance(data, list):
+                data = data[0] if len(data) > 0 else {}
             
-            if resp.status_code == 200:
-                data = resp.json()
+            if debug:
+                debug_log.append("**Raw JSON Response (First 500 chars):**")
+                debug_log.append(str(json.dumps(data))[:500] + "...")
+
+            # 3. Extract Fields based on table mappings
+            for map_row in mappings:
+                j_field = map_row["json_field"]
+                c_name = map_row["csv_column_name"]
                 
-                # Debug: Show the first part of the JSON
-                if debug_mode:
-                    debug_log.append("**Raw JSON Response:**")
-                    debug_log.append(data)
+                # Check if user provided empty mapping
+                if j_field and c_name:
+                    val = data.get(j_field, "")
+                    result_row[c_name] = val
+                    if debug:
+                        debug_log.append(f"✅ Found `{j_field}`: {val} -> Saved to `{c_name}`")
+        else:
+            if debug:
+                debug_log.append(f"❌ API Error: {resp.text}")
+            
+            # Fill empty on error
+            for map_row in mappings:
+                if map_row["csv_column_name"]:
+                    result_row[map_row["csv_column_name"]] = ""
 
-                # Normalize Array vs Object
-                if isinstance(data, list):
-                    data = data[0] if len(data) > 0 else {}
+    except Exception as e:
+        if debug:
+            debug_log.append(f"❌ Exception: {str(e)}")
+        for map_row in mappings:
+            if map_row["csv_column_name"]:
+                result_row[map_row["csv_column_name"]] = ""
                 
-                # Extract Fields
-                for output in api['outputs']:
-                    field_key = output['field']
-                    val = data.get(field_key, None)
-                    
-                    if debug_mode:
-                        debug_log.append(f"👉 Looking for field `'{field_key}'` -> Found: `{val}`")
-
-                    # If val is still None or empty, output is empty string
-                    result_row[output['column']] = val if val is not None else ""
-            else:
-                if debug_mode:
-                    debug_log.append(f"❌ API Failed. Response: {resp.text}")
-                # Fill empty on failure
-                for output in api['outputs']:
-                    result_row[output['column']] = ""
-
-        except Exception as e:
-            if debug_mode:
-                debug_log.append(f"❌ Exception: {str(e)}")
-            for output in api['outputs']:
-                result_row[output['column']] = ""
-
-    if debug_mode:
+    if debug:
         return debug_log
     return result_row
 
-# --- MAIN UI ACTIONS ---
+# --- UI LAYOUT ---
 
-st.divider()
+# 1. TOP BAR: INPUTS
+col1, col2 = st.columns([1, 1])
+with col1:
+    uploaded_file = st.file_uploader("1. Upload CSV", type=["csv"])
+with col2:
+    token_input = st.text_input("2. API Token", placeholder="Paste token (no 'Bearer' prefix needed)", type="password")
 
-if not uploaded_file or not token_input:
-    st.warning("waiting for file and token...")
-else:
-    # Parse Config & File
-    try:
-        config = json.loads(config_input)
-        df = load_csv(uploaded_file)
-        headers = get_headers(token_input)
+# 2. DYNAMIC CONFIGURATION (Only shows if file is uploaded)
+if uploaded_file is not None:
+    csv_headers = load_csv_headers(uploaded_file)
+    
+    st.divider()
+    st.subheader("3. Configuration")
+    
+    c1, c2, c3 = st.columns([1, 1, 1])
+    
+    with c1:
+        # Dynamic Dropdown from CSV
+        id_column = st.selectbox("Which CSV column contains the ID?", options=csv_headers, index=0)
+    
+    with c2:
+        base_url = st.text_input("Base URL", value="https://rest.bridgewise.com")
         
-        # --- ACTION 1: TEST BUTTON (DEBUGGING) ---
-        st.subheader("3. Validation")
-        if st.button("🔍 Test Run (Process 1st Row Only)"):
-            st.write("Running diagnostic on the first row of your CSV...")
-            
-            first_row = df.iloc[0]
-            st.markdown(f"**Input Row Data:** `{first_row.to_dict()}`")
-            
-            # Run with debug mode ON
-            logs = process_row(first_row, config, headers, debug_mode=True)
-            
-            # Display Logs
-            for log in logs:
-                if isinstance(log, dict) or isinstance(log, list):
-                    st.json(log)
-                else:
-                    st.markdown(log)
-                    
-            st.success("Test complete. Check the logs above to see if the data was found.")
+    with c3:
+        # We tell the user to use {id} as the placeholder
+        url_template = st.text_input("Endpoint Path", value="/companies/{id}/analysis?language=en-US", help="Use {id} where the Company ID should go.")
 
-        # --- ACTION 2: BULK RUN ---
-        st.subheader("4. Bulk Processing")
-        if st.button("🚀 Start Full Processing", type="primary"):
+    st.markdown("#### 4. Output Fields Mapping")
+    st.caption("Add rows below to extract more fields from the API. The 'JSON Field' is exactly what the API returns. The 'CSV Column' is what you want to name it in your file.")
+    
+    # EDITABLE TABLE
+    # Users can add/delete rows here easily
+    mapping_df = pd.DataFrame(st.session_state.output_mappings)
+    edited_mapping = st.data_editor(
+        mapping_df, 
+        num_rows="dynamic", 
+        use_container_width=True,
+        column_config={
+            "json_field": st.column_config.TextColumn("JSON Field Name (API)", required=True),
+            "csv_column_name": st.column_config.TextColumn("Output Column Name (CSV)", required=True)
+        }
+    )
+    
+    # Convert back to list of dicts for processing
+    current_mappings = edited_mapping.to_dict('records')
+
+    # --- ACTIONS ---
+    st.divider()
+    st.subheader("5. Execution")
+
+    act_col1, act_col2 = st.columns([1, 4])
+    
+    with act_col1:
+        test_btn = st.button("🔍 Test 1 Row")
+    with act_col2:
+        run_btn = st.button("🚀 Process Full File", type="primary")
+
+    # LOGIC: TEST
+    if test_btn:
+        if not token_input:
+            st.error("Please enter an API Token first.")
+        else:
+            df_preview = load_full_csv(uploaded_file)
+            first_row = df_preview.iloc[0]
+            st.info(f"Testing with ID: {first_row[id_column]}")
             
-            status_area = st.empty()
+            logs = process_single_row(
+                first_row, 
+                id_column, 
+                base_url, 
+                url_template, 
+                current_mappings, 
+                get_headers(token_input), 
+                debug=True
+            )
+            
+            with st.expander("View Test Logs", expanded=True):
+                for l in logs:
+                    st.markdown(l)
+
+    # LOGIC: RUN
+    if run_btn:
+        if not token_input:
+            st.error("Please enter an API Token first.")
+        else:
+            df = load_full_csv(uploaded_file)
+            total_rows = len(df)
+            
             progress_bar = st.progress(0)
-            error_log = []
+            status_text = st.empty()
             
             results = []
-            total_rows = len(df)
-            concurrency = config.get("concurrency", 5)
-
-            status_area.text(f"Starting worker pool with {concurrency} threads...")
-
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                rows = df.to_dict('records')
-                futures = [executor.submit(process_row, row, config, headers) for row in rows]
+            headers = get_headers(token_input)
+            
+            # Using ThreadPool for speed
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                rows_list = df.to_dict('records')
+                futures = []
                 
-                for i, future in enumerate(futures):
-                    try:
-                        res = future.result()
-                        results.append(res)
-                    except Exception as e:
-                        error_log.append(f"Row {i} failed: {str(e)}")
-                    
-                    # Update UI
-                    if i % 10 == 0 or i == total_rows - 1:
+                for row in rows_list:
+                    futures.append(executor.submit(
+                        process_single_row, 
+                        row, 
+                        id_column, 
+                        base_url, 
+                        url_template, 
+                        current_mappings, 
+                        headers, 
+                        False # No debug
+                    ))
+                
+                for i, f in enumerate(futures):
+                    results.append(f.result())
+                    if i % 10 == 0:
                         progress_bar.progress((i + 1) / total_rows)
-                        status_area.text(f"Processed {i + 1}/{total_rows}")
-
-            # Finalize
-            if error_log:
-                st.error(f"Completed with {len(error_log)} errors.")
-                with st.expander("View Errors"):
-                    for err in error_log[:20]:
-                        st.write(err)
-            else:
-                st.success("Done! No errors reported.")
-
-            # Output DataFrame
-            result_df = pd.DataFrame(results)
+                        status_text.text(f"Processed {i + 1}/{total_rows}")
             
-            # Ensure column order
-            final_cols = config.get("outputColumns", [])
-            # Add missing columns if any
-            for col in final_cols:
-                if col not in result_df.columns:
-                    result_df[col] = ""
+            progress_bar.progress(100)
+            status_text.text("Done!")
             
-            # Filter to only requested columns
-            if final_cols:
-                result_df = result_df[final_cols]
-
-            # Download
-            csv_data = result_df.to_csv(index=False).encode('utf-8')
+            # Create Final DataFrame
+            final_df = pd.DataFrame(results)
+            
+            # Reorder: Put the original headers first, then the new ones
+            original_cols = csv_headers
+            new_cols = [m['csv_column_name'] for m in current_mappings if m['csv_column_name']]
+            
+            # Combine unique columns while preserving order
+            all_cols = []
+            seen = set()
+            for c in original_cols + new_cols:
+                if c not in seen:
+                    all_cols.append(c)
+                    seen.add(c)
+            
+            final_df = final_df[all_cols]
+            
+            st.success(f"Processing complete! Enriched {len(final_df)} rows.")
+            
+            csv_data = final_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Result CSV",
                 data=csv_data,
-                file_name="enriched_data.csv",
+                file_name="enriched_output.csv",
                 mime="text/csv"
             )
 
-    except json.JSONDecodeError:
-        st.error("Your Configuration JSON is invalid. Please check the 'Advanced Configuration' section.")
-    except Exception as e:
-        st.error(f"Critical Error: {str(e)}")
+else:
+    st.info("👆 Please upload a CSV file to start configuring the tool.")
