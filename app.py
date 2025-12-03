@@ -7,7 +7,24 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. COMPREHENSIVE SWAGGER DEFINITION (Extracted from provided JSON) ---
+# --- 1. SPECIAL INPUT CONFIGURATION (Enums & Booleans) ---
+# This defines the dropdown options for specific parameters.
+INPUT_CONFIG = {
+    # Booleans
+    "show_all": ["true", "false"],
+    "internal_coverage": ["true", "false"],
+    "policy_threshold": ["true", "false"],
+    "has_score": ["true", "false"],
+    
+    # Enums
+    "scoring_method": ["global", "industry"], # Added as requested
+    "language": ["en-US", "he-IL", "de-DE", "fr-FR", "es-ES", "pt-BR", "ja-JP"],
+    "section_type": ["environmental", "social", "governance", "summary"],
+    "period_type": ["quarterly", "annually", "last_12_month"],
+    "sort_by": ["rank", "-rank", "publication_date", "-publication_date"]
+}
+
+# --- 2. COMPREHENSIVE SWAGGER DEFINITION ---
 SWAGGER_SPECS = {
     "Fundamental Analysis": {
         "/companies/{company_id}/fundamental-analysis": {
@@ -45,7 +62,7 @@ SWAGGER_SPECS = {
         "/companies/{company_id}/esg-analysis": {
             "label": "Get ESG Analysis",
             "path": ["company_id"],
-            "query": ["language", "show_all"],
+            "query": ["language", "scoring_method", "show_all"], # ADDED scoring_method
             "defaults": [{"json_field": "analysis_score", "csv_column": "ESG Score"}]
         },
         "/companies/{company_id}/esg-sections": {
@@ -233,7 +250,7 @@ SWAGGER_SPECS = {
     }
 }
 
-# --- 2. CONFIG & STYLING ---
+# --- 3. CONFIG & HELPERS ---
 st.set_page_config(page_title="BW Enricher", layout="wide", page_icon="🚀")
 
 st.markdown("""
@@ -251,7 +268,6 @@ if "api_steps" not in st.session_state: st.session_state.api_steps = []
 if "df" not in st.session_state: st.session_state.df = None
 if "csv_headers" not in st.session_state: st.session_state.csv_headers = []
 
-# --- 3. HELPER FUNCTIONS ---
 def get_headers(token):
     return {"Authorization": f"Bearer {token.strip()}", "Accept": "application/json"}
 
@@ -264,14 +280,16 @@ def load_csv(file):
         return pd.read_csv(file, encoding='latin1')
 
 def resolve_value(val, row_data):
+    """Replaces {ColName} with actual row data"""
     if not val: return None
-    match = re.search(r"\{(.*?)\}", str(val))
+    val_str = str(val)
+    match = re.search(r"\{(.*?)\}", val_str)
     if match:
         col_name = match.group(1)
         if col_name in row_data:
             clean_val = str(row_data[col_name])
-            return str(val).replace(match.group(0), clean_val)
-    return val
+            return val_str.replace(match.group(0), clean_val)
+    return val_str
 
 def process_single_row(row, api_steps, base_url, headers, debug=False):
     if hasattr(row, 'to_dict'): row_data = row.to_dict()
@@ -283,14 +301,14 @@ def process_single_row(row, api_steps, base_url, headers, debug=False):
         try:
             url_path = step['url_template']
             
-            # 1. Resolve Path Params
+            # 1. Path Params
             for param_name, csv_col in step['path_map'].items():
                 val = str(row_data.get(csv_col, ""))
                 url_path = url_path.replace(f"{{{param_name}}}", val)
             
             full_url = base_url.rstrip('/') + '/' + url_path.lstrip('/')
             
-            # 2. Resolve Query Params
+            # 2. Query Params
             query_payload = {}
             for q_key, q_val in step['query_map'].items():
                 resolved = resolve_value(q_val, row_data)
@@ -376,21 +394,19 @@ with tab_build:
                 selected_cat = st.pills("Category", cat_options, selection_mode="single", default=cat_options[0])
                 cat_endpoints = SWAGGER_SPECS[selected_cat]
                 label_to_url = {v['label']: k for k, v in cat_endpoints.items()}
-                
                 selected_label = st.selectbox("Select Endpoint", list(label_to_url.keys()))
                 selected_url = label_to_url[selected_label]
                 ep_config = cat_endpoints[selected_url]
                 
                 st.caption(f"Path: `{selected_url}`")
                 
-                # 1. PATH PARAMS (Mandatory)
+                # 1. PATH PARAMS
                 path_map = {}
                 if ep_config.get('path'):
                     st.markdown("##### 🔗 Path Parameters")
                     cols = st.columns(len(ep_config['path']))
                     for i, p in enumerate(ep_config['path']):
                         with cols[i]:
-                            # Smart Auto-Match
                             def_idx = 0
                             match_candidates = [p, "id", "ID"]
                             for cand in match_candidates:
@@ -400,41 +416,41 @@ with tab_build:
                                     break
                             path_map[p] = st.selectbox(f"{{{p}}} mapped to:", st.session_state.csv_headers, index=def_idx, key=f"path_{p}")
 
-                # 2. QUERY PARAMS (Table Based Config)
+                # 2. QUERY PARAMS (SMART INPUTS)
                 query_map = {}
                 available_qs = ep_config.get('query', [])
                 
                 if available_qs:
                     st.markdown("##### 🔍 Query Parameters")
-                    # Clean User Interface: Select params -> Edit Values in Table
-                    selected_qs = st.multiselect("Select optional parameters to add:", available_qs)
+                    selected_qs = st.multiselect("Select parameters to configure:", available_qs)
                     
                     if selected_qs:
-                        st.caption("Enter values below. Use `{ColumnName}` to use data from your CSV.")
+                        st.caption("Select a value from the list OR select 'Map from CSV' to use dynamic data.")
+                        q_cols = st.columns(2)
                         
-                        # Prepare data for editor
-                        default_q_data = []
-                        for q in selected_qs:
-                            # Pre-fill specific defaults
-                            val = "en-US" if q == "language" else ""
-                            default_q_data.append({"Parameter": q, "Value": val})
-                        
-                        # Data Editor for easy input
-                        edited_q_df = st.data_editor(
-                            default_q_data,
-                            column_config={
-                                "Parameter": st.column_config.TextColumn("Parameter", disabled=True),
-                                "Value": st.column_config.TextColumn("Value (Static or {Col})", required=True)
-                            },
-                            hide_index=True,
-                            use_container_width=True,
-                            key=f"q_editor_{selected_label}"
-                        )
-                        
-                        # Convert back to dict
-                        for _, row in pd.DataFrame(edited_q_df).iterrows():
-                            if row["Value"]:
-                                query_map[row["Parameter"]] = row["Value"]
+                        for idx, q in enumerate(selected_qs):
+                            with q_cols[idx % 2]:
+                                # Determine Input Type
+                                if q in INPUT_CONFIG:
+                                    # It's an Enum/Boolean -> Dropdown with "Map from CSV" option
+                                    options = INPUT_CONFIG[q]
+                                    map_option = "⚡ Map from CSV..."
+                                    
+                                    # Default selection logic
+                                    idx_sel = 0
+                                    if q == "language": idx_sel = 0 # en-US
+                                    
+                                    choice = st.selectbox(f"{q}", options + [map_option], index=idx_sel, key=f"q_sel_{q}")
+                                    
+                                    if choice == map_option:
+                                        val = st.text_input(f"Enter {{{q}}} column:", placeholder="{ColumnName}", key=f"q_txt_{q}")
+                                        if val: query_map[q] = val
+                                    else:
+                                        query_map[q] = choice
+                                else:
+                                    # Free Text -> Text Input
+                                    val = st.text_input(f"{q}", placeholder="Value or {ColumnName}", key=f"q_free_{q}")
+                                    if val: query_map[q] = val
 
                 # 3. OUTPUTS
                 st.markdown("##### 📤 Output Columns")
@@ -468,9 +484,7 @@ with tab_build:
             for i, step in enumerate(st.session_state.api_steps):
                 with st.expander(f"{i+1}. {step['name']}", expanded=False):
                     st.write(f"**Params:** {step['path_map']}")
-                    if step['query_map']:
-                        st.write("**Query:**")
-                        st.json(step['query_map'])
+                    if step['query_map']: st.write("**Query:**", step['query_map'])
                     st.write("**Outputs:**", [x['csv_column'] for x in step['output_map']])
                     if st.button("🗑️ Remove", key=f"rm_{i}"):
                         st.session_state.api_steps.pop(i)
@@ -521,8 +535,6 @@ with tab_run:
                     status.update(label="Processing Complete!", state="complete", expanded=False)
                 
                 final_df = pd.DataFrame(results)
-                
-                # Smart Filename
                 orig_name = uploaded_file.name.rsplit('.', 1)[0]
                 out_name = f"{orig_name}_output.csv"
                 
